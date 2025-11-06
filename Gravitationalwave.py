@@ -1,0 +1,220 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import sys
+
+# Set a random seed for reproducibility
+np.random.seed(42)
+
+print("Starting gravitational wave MCMC analysis...")
+
+# --- 1. Load and Prepare Data ---
+try:
+
+    file_name = 'gw_data.csv'
+    df = pd.read_csv(file_name)
+
+
+    df['t'] = pd.to_numeric(df['t'])
+    df['h'] = pd.to_numeric(df['h'])
+
+    
+    t_data = df['t'].values
+    y_data = df['h'].values
+
+    # [cite_start]Calculate the 20% error for each data point as per the project [cite: 88]
+    # We use np.abs() to handle negative data values 
+    # and add a small epsilon (1e-9) for numerical stability 
+    # to avoid division by zero if any data point is exactly 0.
+    y_err = 0.20 * np.abs(y_data) + 1e-9
+
+    print("Data loaded successfully.")
+    print(f"Loaded {len(t_data)} data points.")
+    # print(df.head()) # Uncomment for debugging
+
+except FileNotFoundError:
+    print(f"Error: The file '{file_name}' was not found.")
+    print("Please ensure the file is correctly named and accessible.")
+    sys.exit()
+except Exception as e:
+    print(f"An error occurred during data loading: {e}")
+    sys.exit()
+
+
+
+
+def h_model(t, Alpha, Beta, Gamma):
+    """
+    [cite_start]Calculates the analytical template for the signal h(t)[cite: 69].
+    """
+    term1 = Alpha * np.exp(t)
+    term2 = 1.0 - np.tanh(2.0 * (t - Beta))
+    term3 = np.sin(Gamma * t)
+    return term1 * term2 * term3
+
+def log_prior(theta):
+    """
+    [cite_start]Calculates the log of the prior probability P(theta)[cite: 82].
+    Returns 0.0 (log(1)) if parameters are in range, -inf (log(0)) otherwise.
+    """
+    Alpha, Beta, Gamma = theta
+    # [cite_start]Check if parameters are within the specified uniform prior ranges [cite: 72, 73, 74]
+    if 0.0 < Alpha < 2.0 and 1.0 < Beta < 10.0 and 1.0 < Gamma < 20.0:
+        return 0.0
+    return -np.inf
+
+def log_likelihood(theta, t, y, y_err):
+    """
+    [cite_start]Calculates the log-likelihood P(data|theta)[cite: 84, 85].
+    This is the log of (exp(Y)), which is just Y.
+    Y = -sum[ (y_data - y_model)^2 / y_err^2 ]
+    """
+    Alpha, Beta, Gamma = theta
+    
+    # Calculate the model prediction
+    y_model = h_model(t, Alpha, Beta, Gamma)
+    
+    # [cite_start]Calculate Y (Chi-squared term) [cite: 85]
+    Y = -0.5 * np.sum(((y - y_model) / y_err)**2) # Note: Standard chi2 is -0.5*sum(...)
+                                                # [cite_start]The prompt has -sum(...) [cite: 85]
+                                                # Let's follow the prompt's Y
+    
+    Y_prompt = -np.sum(((y - y_model) / y_err)**2)
+    
+    return Y_prompt
+
+def log_posterior(theta, t, y, y_err):
+    """
+    [cite_start]Calculates the log of the posterior probability P(theta|data)[cite: 80].
+    log(P(theta|data)) = log(P(data|theta)) + log(P(theta))
+    """
+    lp = log_prior(theta)
+    if not np.isfinite(lp):
+        return -np.inf
+    
+    ll = log_likelihood(theta, t, y, y_err)
+    
+    return lp + ll
+
+
+
+
+print("Starting Metropolis-Hastings MCMC simulation...")
+
+# MCMC Parameters
+n_steps = 80000  # Total number of steps
+burn_in = 20000  # Number of steps to discard as "burn-in"
+step_sizes = [0.02, 0.05, 0.05]  # Step sizes for [alpha, beta, gamma] proposals
+                                # These may need tuning for a good acceptance rate
+
+# Initial position in parameter space (starting in the middle of priors)
+start_pos = [1.0, 5.0, 10.0]
+
+# Initialize the chain
+chain = []
+accepted_count = 0
+current_pos = start_pos
+current_log_post = log_posterior(current_pos, t_data, y_data, y_err)
+
+for i in range(n_steps):
+    if i % 10000 == 0 and i > 0:
+        print(f"Step {i}/{n_steps}...")
+
+    # [cite_start]Propose a new position using a random walk [cite: 78]
+    proposal_pos = current_pos + np.random.normal(0, step_sizes, 3)
+    
+    # Calculate log-posterior for the new position
+    proposal_log_post = log_posterior(proposal_pos, t_data, y_data, y_err)
+    
+    # Calculate acceptance probability (Metropolis-Hastings ratio)
+    log_acceptance_ratio = proposal_log_post - current_log_post
+    acceptance_prob = min(1.0, np.exp(log_acceptance_ratio))
+    
+    # Accept or reject the step
+    if np.random.rand() < acceptance_prob:
+        # Accept
+        current_pos = proposal_pos
+        current_log_post = proposal_log_post
+        accepted_count += 1
+    
+    # Store the current position (either the new one or the old one)
+    chain.append(current_pos)
+
+print("MCMC simulation finished.")
+
+# --- 4. Process and Plot Results ---
+
+print("Processing results and generating plots...")
+
+# Convert chain to numpy array for easier slicing
+chain = np.array(chain)
+
+# Calculate and print the acceptance rate
+acceptance_rate = accepted_count / n_steps * 100
+print(f"Acceptance Rate: {acceptance_rate:.2f}%")
+print(" (A good rate is ~20-40%. If it's very high or low, adjust 'step_sizes')")
+
+# Discard the burn-in period
+chain_burned = chain[burn_in:, :]
+
+plt.figure(figsize=(8, 6))  # Create a new, single figure
+plt.hist(chain_burned[:, 0], bins=40, density=True, histtype='step', color='blue', lw=2)
+plt.title('Posterior Distribution for Alpha', fontsize=14)
+plt.xlabel('Parameter Alpha', fontsize=12)
+plt.ylabel('Probability Density', fontsize=12)
+plt.tight_layout()
+plt.savefig('alpha_distribution.png')
+print("Saved Alpha distribution plot to 'alpha_distribution.png'")
+plt.close()  # Close the figure to save memory
+
+# --- Plot 2: Beta Distribution ---
+plt.figure(figsize=(8, 6))  # Create another new figure
+plt.hist(chain_burned[:, 1], bins=40, density=True, histtype='step', color='green', lw=2)
+plt.title('Posterior Distribution for Beta', fontsize=14)
+plt.xlabel('Parameter Beta', fontsize=12)
+plt.ylabel('Probability Density', fontsize=12)
+plt.tight_layout()
+plt.savefig('beta_distribution.png')
+print("Saved Beta distribution plot to 'beta_distribution.png'")
+plt.close()  # Close the figure
+
+# --- Plot 3: Gamma Distribution ---
+plt.figure(figsize=(8, 6))  # Create a third new figure
+plt.hist(chain_burned[:, 2], bins=40, density=True, histtype='step', color='red', lw=2)
+plt.title('Posterior Distribution for Gamma', fontsize=14)
+plt.xlabel('Parameter Gamma', fontsize=12)
+plt.ylabel('Probability Density', fontsize=12)
+plt.tight_layout()
+plt.savefig('gamma_distribution.png')
+print("Saved Gamma distribution plot to 'gamma_distribution.png'")
+plt.close()  # Close the figure
+
+# --- Plot 2: Trace Plots (to check convergence) ---
+fig, axes = plt.subplots(3, 1, figsize=(15, 9), sharex=True)
+
+# Alpha trace
+axes[0].plot(chain[:, 0], color='blue', alpha=0.7)
+axes[0].set_title('Trace Plot for Alpha', fontsize=14)
+axes[0].set_ylabel('Parameter Alpha', fontsize=12)
+axes[0].axvline(burn_in, color='k', linestyle='--', label='Burn-in')
+axes[0].legend()
+
+# Beta trace
+axes[1].plot(chain[:, 1], color='green', alpha=0.7)
+axes[1].set_title('Trace Plot for Beta', fontsize=14)
+axes[1].set_ylabel('Parameter Beta', fontsize=12)
+axes[1].axvline(burn_in, color='k', linestyle='--')
+
+# Gamma trace
+axes[2].plot(chain[:, 2], color='red', alpha=0.7)
+axes[2].set_title('Trace Plot for $\gamma$ (Gamma)', fontsize=14)
+axes[2].set_ylabel('Parameter Gamma', fontsize=12)
+axes[2].set_xlabel('MCMC Step Number', fontsize=12)
+axes[2].axvline(burn_in, color='k', linestyle='--')
+
+plt.tight_layout()
+plt.savefig('trace_plots.png')
+print("Saved trace plots to 'trace_plots.png'")
+
+print("\nAnalysis complete.")
+
