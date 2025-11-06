@@ -1,0 +1,292 @@
+\documentclass{beamer}
+
+\usetheme{Berlin}
+\usecolortheme{whale}
+\usepackage[utf8]{inputenc} 
+\usepackage{amsmath}        
+\usepackage{graphicx}       
+\usepackage{booktabs}       
+\usepackage{minted}
+
+\title[GW Parameter Estimation]{Identifying Gravitational Wave Signatures}
+\subtitle{A Metropolis-Hastings MCMC Approach}
+\author{Sameer Choudhary}
+\institute{IIT Hyderabad}
+\date{\today}
+
+% --- BEGIN DOCUMENT ---
+\begin{document}
+
+% --- TITLE SLIDE ---
+\begin{frame}
+    \titlepage
+\end{frame}
+
+\begin{frame}{Outline}
+    \tableofcontents
+\end{frame}
+
+
+%=====================================================
+\section{Introduction}
+%=====================================================
+
+\begin{frame}{Introduction: What are Gravitational Waves?}
+    Gravitational Waves (GW) are fundamental to our understanding of the universe.
+    
+    \begin{itemize}
+        \item Predicted by Albert Einstein's Theory of General Relativity in 1916.
+        \pause
+        \item They are "ripples" in the fabric of spacetime, traveling at the speed of light.
+        \pause
+        \item Caused by the most cataclysmic events in the cosmos, such as:
+        \begin{itemize}
+            \item Merging black holes
+            \item Colliding neutron stars
+            \item Supernovae
+        \end{itemize}
+        \pause
+        \item First directly detected in 2015 by LIGO and Virgo, opening a new era of "multi-messenger astronomy."
+    \end{itemize}
+\end{frame}
+
+%=====================================================
+\section{The Project}
+%=====================================================
+
+\begin{frame}{The Project: Defining the Problem}
+    We are given a mock time-series strain data file, `gw\_data.csv`.
+
+    \begin{itemize}
+        \item This file contains a simulated gravitational wave burst signal.
+        \pause
+        \item The "true" signal is hidden within a significant amount of background noise.
+        \pause
+        \item \textbf{Our Goal:} To perform parameter estimation. We must extract the \textit{true physical parameters} of the signal that are buried in the noise.
+        \pause
+        \item \textbf{Our Tool:} We will use a Bayesian statistical method to find the most probable set of parameters that describe the data.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{The Project: The Model Template}
+    The analytical template for the signal, $h(t)$, is given by:
+    
+    
+    \[
+    h(t) = \alpha \exp(t) \{1 - \tanh[2(t - \beta)]\} \sin(\gamma t)
+    \]
+    
+    \begin{itemize}
+        \item This phenomenological equation models a burst signal:
+        \pause
+        \item $\sin(\gamma t)$ : Represents the core oscillation of the wave.
+        \pause
+        \item $\alpha \exp(t)$ : Models the rapid, exponential growth in the signal's amplitude.
+        \pause
+        \item $\{1 - \tanh[...$\} : Acts as a smooth "turn-off" switch, which rapidly cuts the signal off after $t \approx \beta$.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{The Project: Defining the Parameters}
+    Our goal is to find the posterior probability distribution for $\theta \equiv (\alpha, \beta, \gamma)$.
+    
+    \vfill
+    
+    \textbf{1. $\alpha$ (Alpha): Amplitude}
+    \begin{itemize}
+        \item Describes the strength or "loudness" of the signal.
+        \item Prior (our initial boundary): $0 < \alpha < 2$
+    \end{itemize}
+    \vfill
+    
+    \textbf{2. $\beta$ (Beta): Turn-off Time}
+    \begin{itemize}
+        \item Describes the time at which the signal burst ends.
+        \item Prior: $1 < \beta < 10$
+    \end{itemize}
+    \vfill
+    
+    \textbf{3. $\gamma$ (Gamma): Frequency}
+    \begin{itemize}
+        \item Describes the frequency of the wave's oscillation.
+        \item Prior: $1 < \gamma < 20$
+    \end{itemize}
+\end{frame}
+
+%=====================================================
+\section{The Method}
+%=====================================================
+
+\begin{frame}{The Method: Bayesian Inference}
+    We use Bayes' Theorem to find the probability of our parameters \textit{given} the data.
+    
+    \[
+    \underbrace{P(\theta | \text{data})}_{\text{Posterior}} \propto \underbrace{P(\text{data} | \theta)}_{\text{Likelihood}} \times \underbrace{P(\theta)}_{\text{Prior}}
+    \]
+    
+    \begin{itemize}
+        \item \textbf{Posterior:} What we want. The probability of a parameter set $(\alpha, \beta, \gamma)$ after seeing the data.
+        \pause
+        \item \textbf{Likelihood:} The probability of seeing our data, *if* our parameters were the true values. This is our "goodness-of-fit" metric.
+        \pause
+        \item \textbf{Prior:} Our initial belief about the parameters (the ranges $0 < \alpha < 2$, etc.). This is a "box" that is 1 inside and 0 outside.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{The Method: The Log-Likelihood}
+    The project defines our Likelihood as $P(\text{data} | \theta) \propto \exp(\mathcal{Y})$.
+    
+    \vfill
+    
+    Where $\mathcal{Y}$ is the (negative) Chi-Squared, a sum of the squared differences between the data and the model:
+    
+    \[
+    \mathcal{Y} = -\sum_{i} \frac{(y_{\text{data},i} - y_{\text{model},i})^2}{y_{\text{err},i}^2}
+    \]
+    
+    \vfill
+    
+    \begin{itemize}
+        \item We assume an error of 20\% at each data point ($y_{\text{err},i} = 0.2 \times y_{\text{data},i}$).
+        \pause
+        \item In log-space, our scoring function becomes:
+        \item $\log(\text{Posterior}) = \log(\text{Likelihood}) + \log(\text{Prior})$
+        \item A "good fit" is one that minimizes the difference, making $\mathcal{Y}$ a large negative number, but as close to 0 as possible.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{The Method: Metropolis-Hastings (MCMC)}
+    How do we "search" the 3D parameter space for the best-fit?
+    \vfill
+    We use a **Markov Chain Monte Carlo (MCMC)**, a "smart" random walk.
+    
+    \begin{enumerate}
+        \item Start with an initial guess for $(\alpha, \beta, \gamma)$.
+        \pause
+        \item "Jiggle" the parameters randomly to propose a new, nearby step.
+        \pause
+        \item Calculate the \textit{Posterior} "score" for this new step.
+        \pause
+        \item \textbf{The Metropolis Rule:}
+        \begin{itemize}
+            \item If the new step has a \textbf{better} score, we \textbf{always accept it}.
+            \item If the new step has a \textbf{worse} score, we \textbf{sometimes accept it} (based on a random probability).
+        \end{itemize}
+        \pause
+        \item Repeat this process 80,000 times.
+    \end{enumerate}
+    \vfill
+    This creates a "chain" of steps that preferentially explores the most probable regions of the parameter space.
+\end{frame}
+
+%=====================================================
+\section{Algorithm}
+%=====================================================
+
+\begin{frame}[fragile]{The Algorithm in Python}
+    \frametitle{The Algorithm in Python}
+
+
+\end{frame}
+
+%=====================================================
+\section{Results}
+%=====================================================
+
+
+
+\begin{frame}{Results: MCMC Convergence}
+    \scriptsize
+    \frametitle{Results: MCMC Convergence (Trace Plots)}
+    
+    First, we must check if our simulation converged. These "trace plots" show the value of each parameter at every step.
+    
+    \begin{figure}
+       
+        \includegraphics[height=0.5\textheight, keepaspectratio]{trace_plots.png}
+    \end{figure}
+    
+    \textbf{Analysis:}
+    \begin{itemize}
+        \scriptsize
+        \item The "walkers" rapidly move from their initial guesses to a stable region.
+        \item After the "burn-in" (dashed line), the chains are well-mixed ("fuzzy caterpillars"), showing they are exploring the solution.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Results: Posterior Probability Distributions}
+    These histograms (from the burned chain) show the final probability distribution for each parameter.
+    
+    
+    \begin{figure}
+
+        
+        \includegraphics[width=0.32\textwidth, keepaspectratio]{alpha_distribution.png}
+        \hfill % This adds horizontal space between the images
+        \includegraphics[width=0.32\textwidth, keepaspectratio]{beta_distribution.png}
+        \hfill 
+        \includegraphics[width=0.32\textwidth, keepaspectratio]{gamma_distribution.png}
+    \end{figure}
+    
+    The sharp peaks show high confidence in the recovered values.
+\end{frame}
+% =====
+\begin{frame}{Results: Final Parameter Values}
+    The peaks of the histograms show the most probable value for each parameter.
+    
+    \begin{columns}
+        \begin{column}{0.5\textwidth}
+            \textbf{Parameter}
+            \vfill
+            $\alpha$ (Amplitude)
+            \vfill
+            $\beta$ (Turn-off)
+            \vfill
+            $\gamma$ (Frequency)
+        \end{column}
+        \begin{column}{0.5\textwidth}
+            \textbf{Recovered Value}
+            \vfill
+            $\sim 0.0085$
+            \vfill
+            $\sim 2.2$
+            \vfill
+            $\sim 10.25$
+        \end{column}
+    \end{columns}
+    
+    \vfill
+    
+    \begin{itemize}
+        \item The narrow, sharp peaks for all three parameters indicate a high degree of confidence in these recovered values.
+        \item The simulation successfully "found" the signal hidden in the noise.
+    \end{itemize}
+\end{frame}
+
+%=====================================================
+\section{Conclusion}
+%=====================================================
+
+\begin{frame}{Conclusion}
+    \begin{itemize}
+        \item We successfully implemented a Metropolis-Hastings MCMC algorithm to analyze a mock gravitational wave signal.
+        \pause
+        \item The provided analytical template $h(t)$ proved to be an excellent model for the underlying data.
+        \pause
+        \item Our algorithm successfully converged and recovered the hidden parameters ($\alpha, \beta, \gamma$) from the noisy time-series data with high confidence.
+        \pause
+        \item This project demonstrates a core technique used in real gravitational wave data analysis for parameter estimation.
+    \end{itemize}
+\end{frame}
+
+% --- FINAL SLIDE ---
+\begin{frame}
+    \centering
+    \vfill
+    {\Huge Questions?}
+    \vfill
+    {\Large Thank you.}
+    \vfill
+\end{frame}
+
+\end{document}
