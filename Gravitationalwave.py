@@ -1,220 +1,196 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import sys
-
-# Set a random seed for reproducibility
-np.random.seed(42)
-
-print("Starting gravitational wave MCMC analysis...")
-
-# --- 1. Load and Prepare Data ---
-try:
-
-    file_name = 'gw_data.csv'
-    df = pd.read_csv(file_name)
+import corner
+import time
+import os
 
 
-    df['t'] = pd.to_numeric(df['t'])
-    df['h'] = pd.to_numeric(df['h'])
+data_file = "gw_data.csv"     
+n_steps = 400_000              
+burn_in = 100_000              
+step_sizes = np.array([5.0e-4, 0.0010, 0.007])  
 
-    
-    t_data = df['t'].values
-    y_data = df['h'].values
-
-    # [cite_start]Calculate the 20% error for each data point as per the project [cite: 88]
-    # We use np.abs() to handle negative data values 
-    # and add a small epsilon (1e-9) for numerical stability 
-    # to avoid division by zero if any data point is exactly 0.
-    y_err = 0.20 * np.abs(y_data) + 1e-9
-
-    print("Data loaded successfully.")
-    print(f"Loaded {len(t_data)} data points.")
-    # print(df.head()) # Uncomment for debugging
-
-except FileNotFoundError:
-    print(f"Error: The file '{file_name}' was not found.")
-    print("Please ensure the file is correctly named and accessible.")
-    sys.exit()
-except Exception as e:
-    print(f"An error occurred during data loading: {e}")
-    sys.exit()
+start_pos = [1.0, 2.0, 10.0]  
+random_seed = 42              
 
 
+alpha_bounds = (0.0, 2.0)
+beta_bounds  = (1.0, 10.0)
+gamma_bounds = (1.0, 20.0)
 
 
 def h_model(t, Alpha, Beta, Gamma):
-    """
-    [cite_start]Calculates the analytical template for the signal h(t)[cite: 69].
-    """
-    term1 = Alpha * np.exp(t)
-    term2 = 1.0 - np.tanh(2.0 * (t - Beta))
-    term3 = np.sin(Gamma * t)
-    return term1 * term2 * term3
+    return Alpha * np.exp(t) * (1.0 - np.tanh(2.0 * (t - Beta))) * np.sin(Gamma * t)
 
 def log_prior(theta):
-    """
-    [cite_start]Calculates the log of the prior probability P(theta)[cite: 82].
-    Returns 0.0 (log(1)) if parameters are in range, -inf (log(0)) otherwise.
-    """
-    Alpha, Beta, Gamma = theta
-    # [cite_start]Check if parameters are within the specified uniform prior ranges [cite: 72, 73, 74]
-    if 0.0 < Alpha < 2.0 and 1.0 < Beta < 10.0 and 1.0 < Gamma < 20.0:
+    a, b, g = theta
+    if (alpha_bounds[0] < a < alpha_bounds[1]) and (beta_bounds[0] < b < beta_bounds[1]) and (gamma_bounds[0] < g < gamma_bounds[1]):
         return 0.0
     return -np.inf
 
 def log_likelihood(theta, t, y, y_err):
-    """
-    [cite_start]Calculates the log-likelihood P(data|theta)[cite: 84, 85].
-    This is the log of (exp(Y)), which is just Y.
-    Y = -sum[ (y_data - y_model)^2 / y_err^2 ]
-    """
-    Alpha, Beta, Gamma = theta
-    
-    # Calculate the model prediction
-    y_model = h_model(t, Alpha, Beta, Gamma)
-    
-    # [cite_start]Calculate Y (Chi-squared term) [cite: 85]
-    Y = -0.5 * np.sum(((y - y_model) / y_err)**2) # Note: Standard chi2 is -0.5*sum(...)
-                                                # [cite_start]The prompt has -sum(...) [cite: 85]
-                                                # Let's follow the prompt's Y
-    
-    Y_prompt = -np.sum(((y - y_model) / y_err)**2)
-    
-    return Y_prompt
+    a, b, g = theta
+    ymod = h_model(t, a, b, g)
+    chi2 = np.sum(((y - ymod) / y_err) ** 2)
+    return -0.5 * chi2
 
 def log_posterior(theta, t, y, y_err):
-    """
-    [cite_start]Calculates the log of the posterior probability P(theta|data)[cite: 80].
-    log(P(theta|data)) = log(P(data|theta)) + log(P(theta))
-    """
     lp = log_prior(theta)
     if not np.isfinite(lp):
         return -np.inf
-    
-    ll = log_likelihood(theta, t, y, y_err)
-    
-    return lp + ll
+    return lp + log_likelihood(theta, t, y, y_err)
 
 
+def autocorr_fft(x):
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    x = x - np.mean(x)
+    # next power of two length for FFT
+    nfft = 1 << ((2*n - 1).bit_length())
+    s = np.fft.fft(x, n=nfft)
+    acf = np.fft.ifft(s * np.conjugate(s)).real[:n]
+    acf /= acf[0]
+    return acf
+
+def integrated_time(x, max_lag=None):
+    acf = autocorr_fft(x)
+    if max_lag is None:
+        max_lag = min(len(acf)-1, 10000)
+    tau = 1.0
+    for lag in range(1, max_lag):
+        if acf[lag] <= 0:
+            break
+        tau += 2.0 * acf[lag]
+    return tau
 
 
-print("Starting Metropolis-Hastings MCMC simulation...")
+if not os.path.exists(data_file):
+    raise FileNotFoundError(f"'{data_file}' not found in cwd: {os.getcwd()}")
 
-# MCMC Parameters
-n_steps = 80000  # Total number of steps
-burn_in = 20000  # Number of steps to discard as "burn-in"
-step_sizes = [0.02, 0.05, 0.05]  # Step sizes for [alpha, beta, gamma] proposals
-                                # These may need tuning for a good acceptance rate
+# prefer columns 0 and 2 (observed format has blank middle column)
+try:
+    df = pd.read_csv(data_file, header=0, comment='#', skipinitialspace=True, encoding='utf-8-sig', engine='python', usecols=[0, 2])
+except Exception:
+    df_all = pd.read_csv(data_file, header=0, comment='#', skipinitialspace=True, encoding='utf-8-sig', engine='python')
+    df = df_all.iloc[:, [0, -1]]
 
-# Initial position in parameter space (starting in the middle of priors)
-start_pos = [1.0, 5.0, 10.0]
+df.columns = ['t', 'h']
+df = df.apply(pd.to_numeric, errors='coerce').dropna()
+if df.shape[0] == 0:
+    raise ValueError("No numeric rows after CSV cleaning — check gw_data.csv format.")
+t_data = df['t'].values
+y_data = df['h'].values
+print(f"Loaded {len(t_data)} data points.")
 
-# Initialize the chain
-chain = []
-accepted_count = 0
-current_pos = start_pos
-current_log_post = log_posterior(current_pos, t_data, y_data, y_err)
+data_std_dev = np.std(y_data)
+y_err = 0.20 * data_std_dev
 
+print(f"Using constant (homoscedastic) error (20% of data std dev): sigma = {y_err:.4f}")
+
+
+rng = np.random.default_rng(random_seed)
+theta = np.array(start_pos, dtype=float)
+current_lp = log_posterior(theta, t_data, y_data, y_err)
+
+chain = np.zeros((n_steps, 3))
+n_accept = 0
+
+print(f"Starting single-chain MCMC: n_steps={n_steps}, burn_in={burn_in}")
+t0 = time.time()
 for i in range(n_steps):
-    if i % 10000 == 0 and i > 0:
-        print(f"Step {i}/{n_steps}...")
+    proposal = theta + rng.normal(scale=step_sizes, size=3)
+    prop_lp = log_posterior(proposal, t_data, y_data, y_err)
+    if prop_lp > current_lp or rng.random() < np.exp(prop_lp - current_lp):
+        theta = proposal
+        current_lp = prop_lp
+        n_accept += 1
+    chain[i] = theta
+    # occasional status
+    if (i+1) % 50000 == 0:
+        print(f"  step {i+1}/{n_steps}, accept_rate ~ {n_accept/(i+1):.3f}")
+t1 = time.time()
+print(f"Single-chain MCMC finished in {t1 - t0:.1f} s")
 
-    # [cite_start]Propose a new position using a random walk [cite: 78]
-    proposal_pos = current_pos + np.random.normal(0, step_sizes, 3)
-    
-    # Calculate log-posterior for the new position
-    proposal_log_post = log_posterior(proposal_pos, t_data, y_data, y_err)
-    
-    # Calculate acceptance probability (Metropolis-Hastings ratio)
-    log_acceptance_ratio = proposal_log_post - current_log_post
-    acceptance_prob = min(1.0, np.exp(log_acceptance_ratio))
-    
-    # Accept or reject the step
-    if np.random.rand() < acceptance_prob:
-        # Accept
-        current_pos = proposal_pos
-        current_log_post = proposal_log_post
-        accepted_count += 1
-    
-    # Store the current position (either the new one or the old one)
-    chain.append(current_pos)
+acceptance_rate = n_accept / n_steps
+print(f"Acceptance rate: {acceptance_rate:.3f}")
 
-print("MCMC simulation finished.")
 
-# --- 4. Process and Plot Results ---
 
-print("Processing results and generating plots...")
+if burn_in >= n_steps:
+    raise ValueError("burn_in must be < n_steps")
 
-# Convert chain to numpy array for easier slicing
-chain = np.array(chain)
+chain_post = chain[burn_in:, :]
+n_post = chain_post.shape[0]
+print(f"Using {n_post} post-burn-in samples for diagnostics and plotting")
 
-# Calculate and print the acceptance rate
-acceptance_rate = accepted_count / n_steps * 100
-print(f"Acceptance Rate: {acceptance_rate:.2f}%")
-print(" (A good rate is ~20-40%. If it's very high or low, adjust 'step_sizes')")
+# Estimate autocorrelation time and ESS for each parameter
+taus = []
+ess = []
+for p in range(3):
+    tau_p = integrated_time(chain_post[:, p])
+    taus.append(tau_p)
+    ess_p = n_post / max(1.0, 2.0 * tau_p)   # single chain ESS approx
+    ess.append(ess_p)
 
-# Discard the burn-in period
-chain_burned = chain[burn_in:, :]
+print("Estimated integrated autocorrelation times (tau):", [f"{t:.1f}" for t in taus])
+print("Approx. effective sample sizes (ESS):", [f"{e:.0f}" for e in ess])
 
-plt.figure(figsize=(8, 6))  # Create a new, single figure
-plt.hist(chain_burned[:, 0], bins=40, density=True, histtype='step', color='blue', lw=2)
-plt.title('Posterior Distribution for Alpha', fontsize=14)
-plt.xlabel('Parameter Alpha', fontsize=12)
-plt.ylabel('Probability Density', fontsize=12)
-plt.tight_layout()
-plt.savefig('alpha_distribution.png')
-print("Saved Alpha distribution plot to 'alpha_distribution.png'")
-plt.close()  # Close the figure to save memory
+# Posterior summaries
+means = np.mean(chain_post, axis=0)
+medians = np.median(chain_post, axis=0)
+stds = np.std(chain_post, axis=0)
+print("Posterior means (alpha, beta, gamma):", means)
+print("Posterior medians:", medians)
+print("Posterior stds:", stds)
 
-# --- Plot 2: Beta Distribution ---
-plt.figure(figsize=(8, 6))  # Create another new figure
-plt.hist(chain_burned[:, 1], bins=40, density=True, histtype='step', color='green', lw=2)
-plt.title('Posterior Distribution for Beta', fontsize=14)
-plt.xlabel('Parameter Beta', fontsize=12)
-plt.ylabel('Probability Density', fontsize=12)
-plt.tight_layout()
-plt.savefig('beta_distribution.png')
-print("Saved Beta distribution plot to 'beta_distribution.png'")
-plt.close()  # Close the figure
 
-# --- Plot 3: Gamma Distribution ---
-plt.figure(figsize=(8, 6))  # Create a third new figure
-plt.hist(chain_burned[:, 2], bins=40, density=True, histtype='step', color='red', lw=2)
-plt.title('Posterior Distribution for Gamma', fontsize=14)
-plt.xlabel('Parameter Gamma', fontsize=12)
-plt.ylabel('Probability Density', fontsize=12)
-plt.tight_layout()
-plt.savefig('gamma_distribution.png')
-print("Saved Gamma distribution plot to 'gamma_distribution.png'")
-plt.close()  # Close the figure
+labels = ["Alpha (α)", "Beta (β)", "Gamma (γ)"]
+colors = ["red", "red", "red"]
 
-# --- Plot 2: Trace Plots (to check convergence) ---
-fig, axes = plt.subplots(3, 1, figsize=(15, 9), sharex=True)
+fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
+for p in range(3):
+    axes[p].plot(chain_post[:, p], color=colors[p], alpha=0.7, lw=0.5)
+    axes[p].set_ylabel(labels[p])
+    axes[p].set_title(f"Trace Plot for {labels[p]}")
+axes[-1].set_xlabel("Post-burn-in step")
+fig.suptitle("MCMC Trace Plots", fontsize=14)
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.savefig("trace_fit.png")
+plt.show()
 
-# Alpha trace
-axes[0].plot(chain[:, 0], color='blue', alpha=0.7)
-axes[0].set_title('Trace Plot for Alpha', fontsize=14)
-axes[0].set_ylabel('Parameter Alpha', fontsize=12)
-axes[0].axvline(burn_in, color='k', linestyle='--', label='Burn-in')
-axes[0].legend()
 
-# Beta trace
-axes[1].plot(chain[:, 1], color='green', alpha=0.7)
-axes[1].set_title('Trace Plot for Beta', fontsize=14)
-axes[1].set_ylabel('Parameter Beta', fontsize=12)
-axes[1].axvline(burn_in, color='k', linestyle='--')
 
-# Gamma trace
-axes[2].plot(chain[:, 2], color='red', alpha=0.7)
-axes[2].set_title('Trace Plot for $\gamma$ (Gamma)', fontsize=14)
-axes[2].set_ylabel('Parameter Gamma', fontsize=12)
-axes[2].set_xlabel('MCMC Step Number', fontsize=12)
-axes[2].axvline(burn_in, color='k', linestyle='--')
+thin = max(1, int(max(1, ess[0]//50)))  
+combined_for_corner = chain_post[::thin]
+fig_corner = corner.corner(combined_for_corner, labels=labels, quantiles=[0.16, 0.5, 0.84],
+                           show_titles=True, title_kwargs={"fontsize": 12})
 
-plt.tight_layout()
-plt.savefig('trace_plots.png')
-print("Saved trace plots to 'trace_plots.png'")
+fig_corner.suptitle(" ", fontsize=14)
+plt.savefig("corner_fit.png")
+plt.show()
 
-print("\nAnalysis complete.")
+
+alpha_fit, beta_fit, gamma_fit = medians
+print(f"Best-fit (median) parameters: alpha={alpha_fit:.4f}, beta={beta_fit:.4f}, gamma={gamma_fit:.4f}")
+
+t_model = np.linspace(np.min(t_data), np.max(t_data), 2000)
+y_model = h_model(t_model, alpha_fit, beta_fit, gamma_fit)
+
+plt.figure(figsize=(10, 5))
+plt.plot(t_data, y_data, 'k.', alpha=0.25, markersize=2, label='data')
+plt.plot(t_model, y_model, 'r-', lw=2, label=f'model α={alpha_fit:.3f}, β={beta_fit:.3f}, γ={gamma_fit:.3f}')
+plt.xlabel('t')
+plt.ylabel('h')
+plt.title('Best-fit Model vs Data')
+plt.legend()
+plt.grid(True)
+plt.savefig("best_fit.png")
+
+plt.show()
+
+print("\nFinished. Files saved:")
+
+
+
 
